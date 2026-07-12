@@ -3,8 +3,10 @@ import os
 import time
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
-# Global in-memory state store for party member cooldowns
+# Global in-memory state store for party member cooldowns, isolated by room_id
+# Format: { room_id: { player_name: { skill_name: { is_ready: bool, timestamp: float, cooldown_duration: int } } } }
 PARTY_STATES = {}
 
 class PartyStatusHandler(BaseHTTPRequestHandler):
@@ -19,15 +21,19 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                 post_data = self.rfile.read(content_length)
                 data = json.loads(post_data.decode("utf-8"))
                 
+                room_id = data.get("room_id", "default")
                 player = data.get("player")
                 skill = data.get("skill")
                 is_ready = data.get("is_ready")
                 cooldown_duration = data.get("cooldown_duration", 0)
                 
                 if player and skill is not None:
-                    if player not in PARTY_STATES:
-                        PARTY_STATES[player] = {}
-                    PARTY_STATES[player][skill] = {
+                    if room_id not in PARTY_STATES:
+                        PARTY_STATES[room_id] = {}
+                    if player not in PARTY_STATES[room_id]:
+                        PARTY_STATES[room_id][player] = {}
+                        
+                    PARTY_STATES[room_id][player][skill] = {
                         "is_ready": is_ready,
                         "timestamp": time.time(),
                         "cooldown_duration": cooldown_duration
@@ -36,8 +42,21 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(b'{"status":"success"}')
+                
             elif self.path == "/clear":
-                PARTY_STATES.clear()
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length)
+                data = {}
+                if content_length > 0:
+                    try:
+                        data = json.loads(post_data.decode("utf-8"))
+                    except Exception:
+                        pass
+                
+                room_id = data.get("room_id", "default")
+                if room_id in PARTY_STATES:
+                    PARTY_STATES[room_id].clear()
+                    
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
@@ -54,11 +73,18 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                 pass
 
     def do_GET(self):
-        if self.path == "/status":
+        parsed_url = urlparse(self.path)
+        if parsed_url.path == "/status":
+            query_params = parse_qs(parsed_url.query)
+            room_id = query_params.get("room_id", ["default"])[0]
+            
+            # Fetch states for the specified room only
+            room_states = PARTY_STATES.get(room_id, {})
+            
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps(PARTY_STATES).encode("utf-8"))
+            self.wfile.write(json.dumps(room_states).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
