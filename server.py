@@ -81,10 +81,15 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
             # Fetch states for the specified room only
             room_states = PARTY_STATES.get(room_id, {})
             
+            response_data = {
+                "server_time": time.time(),
+                "states": room_states
+            }
+            
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps(room_states).encode("utf-8"))
+            self.wfile.write(json.dumps(response_data).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
