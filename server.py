@@ -6,11 +6,14 @@ import hashlib
 import base64
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 # Global lock and clients dictionary for WebSocket handling
 STATE_LOCK = threading.Lock()
 WEBSOCKET_CLIENTS = {}  # { room_id: set(handler) }
+# The currently authoritative WebSocket for each client id.  This prevents a
+# late close/update from an older connection removing a newly connected player.
+ROOM_CLIENT_CONNECTIONS = {}
 
 def read_ws_frame(rfile):
     first_byte = rfile.read(1)
@@ -81,20 +84,41 @@ def send_ws_message(wfile, text):
 # Format: { room_id: { player_name: { skill_name: { is_ready: bool, timestamp: float, cooldown_duration: int } } } }
 PARTY_STATES = {}
 
-# Map unique client_id to player_name to enforce one character per client
+# Map unique client_id to player_name to enforce one character per client.
 ROOM_CLIENT_MAP = {}
 
-def register_client_player(room_id, client_id, player_name):
-    if not client_id:
-        return
+def broadcast_ws_message_locked(room_id, message):
+    """Broadcast while STATE_LOCK is held, pruning broken connections."""
+    payload = json.dumps(message)
+    dead_clients = set()
+    for client in WEBSOCKET_CLIENTS.get(room_id, set()):
+        if not send_ws_message(client.wfile, payload):
+            dead_clients.add(client)
+    if dead_clients:
+        WEBSOCKET_CLIENTS.get(room_id, set()).difference_update(dead_clients)
+
+def remove_player_locked(room_id, player_name):
+    """Remove a player and immediately invalidate every connected UI cache."""
+    room_states = PARTY_STATES.get(room_id)
+    if room_states and room_states.pop(player_name, None) is not None:
+        broadcast_ws_message_locked(room_id, {"type": "remove", "player": player_name})
+
+def register_client_player(room_id, client_id, player_name, handler=None):
+    """Make client_id own exactly one character in a room."""
     with STATE_LOCK:
+        if not client_id:
+            return
         if room_id not in ROOM_CLIENT_MAP:
             ROOM_CLIENT_MAP[room_id] = {}
         old_player = ROOM_CLIENT_MAP[room_id].get(client_id)
         if old_player and old_player != player_name:
-            if room_id in PARTY_STATES:
-                PARTY_STATES[room_id].pop(old_player, None)
+            remove_player_locked(room_id, old_player)
         ROOM_CLIENT_MAP[room_id][client_id] = player_name
+        if handler is not None:
+            previous_handler = ROOM_CLIENT_CONNECTIONS.setdefault(room_id, {}).get(client_id)
+            if previous_handler is not None and previous_handler is not handler:
+                WEBSOCKET_CLIENTS.get(room_id, set()).discard(previous_handler)
+            ROOM_CLIENT_CONNECTIONS[room_id][client_id] = handler
 
 class PartyStatusHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -102,68 +126,7 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
         pass
         
     def do_POST(self):
-        try:
-            if self.path == "/update":
-                content_length = int(self.headers.get('Content-Length', 0))
-                post_data = self.rfile.read(content_length)
-                data = json.loads(post_data.decode("utf-8"))
-                
-                room_id = data.get("room_id", "default")
-                player = data.get("player")
-                client_id = data.get("client_id")
-                class_name = data.get("class_name", "홀리나이트")
-                skill = data.get("skill")
-                is_ready = data.get("is_ready")
-                cooldown_duration = data.get("cooldown_duration", 0)
-                
-                register_client_player(room_id, client_id, player)
-                
-                if player and skill is not None:
-                    if room_id not in PARTY_STATES:
-                        PARTY_STATES[room_id] = {}
-                    if player not in PARTY_STATES[room_id]:
-                        PARTY_STATES[room_id][player] = {}
-                        
-                    PARTY_STATES[room_id][player]["_class"] = class_name
-                    PARTY_STATES[room_id][player]["_client_id"] = client_id
-                    PARTY_STATES[room_id][player][skill] = {
-                        "is_ready": is_ready,
-                        "timestamp": time.time(),
-                        "cooldown_duration": cooldown_duration
-                    }
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"status":"success"}')
-                
-            elif self.path == "/clear":
-                content_length = int(self.headers.get('Content-Length', 0))
-                post_data = self.rfile.read(content_length)
-                data = {}
-                if content_length > 0:
-                    try:
-                        data = json.loads(post_data.decode("utf-8"))
-                    except Exception:
-                        pass
-                
-                room_id = data.get("room_id", "default")
-                if room_id in PARTY_STATES:
-                    PARTY_STATES[room_id].clear()
-                    
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"status":"cleared"}')
-            else:
-                self.send_response(404)
-                self.end_headers()
-        except Exception as e:
-            try:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(str(e).encode('utf-8'))
-            except Exception:
-                pass
+        self.send_error(405, "This relay accepts WebSocket connections only")
 
     def do_GET(self):
         parsed_url = urlparse(self.path)
@@ -191,22 +154,6 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
             else:
                 self.send_response(400)
                 self.end_headers()
-        elif parsed_url.path == "/status":
-            query_params = parse_qs(parsed_url.query)
-            room_id = query_params.get("room_id", ["default"])[0]
-            
-            # Fetch states for the specified room only
-            room_states = PARTY_STATES.get(room_id, {})
-            
-            response_data = {
-                "server_time": time.time(),
-                "states": room_states
-            }
-            
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(response_data).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
@@ -214,6 +161,7 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
     def handle_ws_connection(self):
         room_id = "default"
         player_name = "unknown"
+        connection_client_id = None
         registered = False
         
         try:
@@ -242,7 +190,8 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                         client_id = msg.get("client_id")
                         class_name = msg.get("class_name", "홀리나이트")
                         
-                        register_client_player(room_id, client_id, player_name)
+                        register_client_player(room_id, client_id, player_name, self)
+                        connection_client_id = client_id
                         
                         with STATE_LOCK:
                             if room_id not in WEBSOCKET_CLIENTS:
@@ -276,10 +225,13 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                         is_ready = msg.get("is_ready")
                         cooldown_duration = msg.get("cooldown_duration", 0)
                         
-                        register_client_player(room_id, client_id, player)
-                        
                         if player and skill is not None:
                             with STATE_LOCK:
+                                # A replaced/older socket must never restore its old name.
+                                if player != player_name or client_id != connection_client_id:
+                                    continue
+                                if client_id and ROOM_CLIENT_CONNECTIONS.get(room_id, {}).get(client_id) is not self:
+                                    continue
                                 if room_id not in PARTY_STATES:
                                     PARTY_STATES[room_id] = {}
                                 if player not in PARTY_STATES[room_id]:
@@ -293,23 +245,13 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                                     "cooldown_duration": cooldown_duration
                                 }
                                 
-                                # Broadcast update to all clients in the same room
-                                broadcast_msg = {
+                                broadcast_ws_message_locked(room_id, {
                                     "type": "update",
                                     "server_time": time.time(),
                                     "player": player,
                                     "skill": skill,
                                     "state": PARTY_STATES[room_id][player][skill]
-                                }
-                                payload_str = json.dumps(broadcast_msg)
-                                
-                                dead_clients = set()
-                                for client in WEBSOCKET_CLIENTS.get(room_id, []):
-                                    if not send_ws_message(client.wfile, payload_str):
-                                        dead_clients.add(client)
-                                
-                                if dead_clients:
-                                    WEBSOCKET_CLIENTS[room_id].difference_update(dead_clients)
+                                })
         except Exception:
             pass
         finally:
@@ -317,14 +259,15 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                 with STATE_LOCK:
                     if room_id in WEBSOCKET_CLIENTS:
                         WEBSOCKET_CLIENTS[room_id].discard(self)
-                    # Remove player from PARTY_STATES when they disconnect
-                    if room_id in PARTY_STATES and player_name in PARTY_STATES[room_id]:
-                        del PARTY_STATES[room_id][player_name]
-                    # Also clean up ROOM_CLIENT_MAP entry so reconnect is fresh
-                    if room_id in ROOM_CLIENT_MAP:
-                        keys_to_remove = [k for k, v in ROOM_CLIENT_MAP[room_id].items() if v == player_name]
-                        for k in keys_to_remove:
-                            del ROOM_CLIENT_MAP[room_id][k]
+                    current_handler = ROOM_CLIENT_CONNECTIONS.get(room_id, {}).get(connection_client_id)
+                    # Ignore a late close from a superseded connection.
+                    if connection_client_id and current_handler is not self:
+                        return
+                    if connection_client_id:
+                        ROOM_CLIENT_CONNECTIONS.get(room_id, {}).pop(connection_client_id, None)
+                    if ROOM_CLIENT_MAP.get(room_id, {}).get(connection_client_id) == player_name:
+                        ROOM_CLIENT_MAP[room_id].pop(connection_client_id, None)
+                    remove_player_locked(room_id, player_name)
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
