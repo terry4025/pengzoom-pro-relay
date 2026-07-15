@@ -252,6 +252,25 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                                     "skill": skill,
                                     "state": PARTY_STATES[room_id][player][skill]
                                 })
+                    elif action == "class":
+                        room_id = msg.get("room_id", "default")
+                        player = msg.get("player")
+                        client_id = msg.get("client_id")
+                        class_name = msg.get("class_name")
+
+                        if player and class_name:
+                            with STATE_LOCK:
+                                # Only the connection that joined as this player may change its class.
+                                if player != player_name or client_id != connection_client_id:
+                                    continue
+                                if client_id and ROOM_CLIENT_CONNECTIONS.get(room_id, {}).get(client_id) is not self:
+                                    continue
+                                PARTY_STATES.setdefault(room_id, {}).setdefault(player, {})["_class"] = class_name
+                                broadcast_ws_message_locked(room_id, {
+                                    "type": "class",
+                                    "player": player,
+                                    "class_name": class_name,
+                                })
         except Exception:
             pass
         finally:
