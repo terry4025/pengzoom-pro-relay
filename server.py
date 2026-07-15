@@ -81,6 +81,21 @@ def send_ws_message(wfile, text):
 # Format: { room_id: { player_name: { skill_name: { is_ready: bool, timestamp: float, cooldown_duration: int } } } }
 PARTY_STATES = {}
 
+# Map unique client_id to player_name to enforce one character per client
+ROOM_CLIENT_MAP = {}
+
+def register_client_player(room_id, client_id, player_name):
+    if not client_id:
+        return
+    with STATE_LOCK:
+        if room_id not in ROOM_CLIENT_MAP:
+            ROOM_CLIENT_MAP[room_id] = {}
+        old_player = ROOM_CLIENT_MAP[room_id].get(client_id)
+        if old_player and old_player != player_name:
+            if room_id in PARTY_STATES:
+                PARTY_STATES[room_id].pop(old_player, None)
+        ROOM_CLIENT_MAP[room_id][client_id] = player_name
+
 class PartyStatusHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Mute logging to keep stdout clean
@@ -95,9 +110,13 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                 
                 room_id = data.get("room_id", "default")
                 player = data.get("player")
+                client_id = data.get("client_id")
+                class_name = data.get("class_name", "홀리나이트")
                 skill = data.get("skill")
                 is_ready = data.get("is_ready")
                 cooldown_duration = data.get("cooldown_duration", 0)
+                
+                register_client_player(room_id, client_id, player)
                 
                 if player and skill is not None:
                     if room_id not in PARTY_STATES:
@@ -105,6 +124,8 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                     if player not in PARTY_STATES[room_id]:
                         PARTY_STATES[room_id][player] = {}
                         
+                    PARTY_STATES[room_id][player]["_class"] = class_name
+                    PARTY_STATES[room_id][player]["_client_id"] = client_id
                     PARTY_STATES[room_id][player][skill] = {
                         "is_ready": is_ready,
                         "timestamp": time.time(),
@@ -218,12 +239,24 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                     if action == "join":
                         room_id = msg.get("room_id", "default")
                         player_name = msg.get("player", "unknown")
+                        client_id = msg.get("client_id")
+                        class_name = msg.get("class_name", "홀리나이트")
+                        
+                        register_client_player(room_id, client_id, player_name)
                         
                         with STATE_LOCK:
                             if room_id not in WEBSOCKET_CLIENTS:
                                 WEBSOCKET_CLIENTS[room_id] = set()
                             WEBSOCKET_CLIENTS[room_id].add(self)
                             registered = True
+                            
+                            if room_id not in PARTY_STATES:
+                                PARTY_STATES[room_id] = {}
+                            if player_name not in PARTY_STATES[room_id]:
+                                PARTY_STATES[room_id][player_name] = {}
+                            
+                            PARTY_STATES[room_id][player_name]["_class"] = class_name
+                            PARTY_STATES[room_id][player_name]["_client_id"] = client_id
                             
                             # Send initial room state
                             room_states = PARTY_STATES.get(room_id, {})
@@ -237,9 +270,13 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                     elif action == "update":
                         room_id = msg.get("room_id", "default")
                         player = msg.get("player")
+                        client_id = msg.get("client_id")
+                        class_name = msg.get("class_name", "홀리나이트")
                         skill = msg.get("skill")
                         is_ready = msg.get("is_ready")
                         cooldown_duration = msg.get("cooldown_duration", 0)
+                        
+                        register_client_player(room_id, client_id, player)
                         
                         if player and skill is not None:
                             with STATE_LOCK:
@@ -248,6 +285,8 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                                 if player not in PARTY_STATES[room_id]:
                                     PARTY_STATES[room_id][player] = {}
                                     
+                                PARTY_STATES[room_id][player]["_class"] = class_name
+                                PARTY_STATES[room_id][player]["_client_id"] = client_id
                                 PARTY_STATES[room_id][player][skill] = {
                                     "is_ready": is_ready,
                                     "timestamp": time.time(),
@@ -278,6 +317,14 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
                 with STATE_LOCK:
                     if room_id in WEBSOCKET_CLIENTS:
                         WEBSOCKET_CLIENTS[room_id].discard(self)
+                    # Remove player from PARTY_STATES when they disconnect
+                    if room_id in PARTY_STATES and player_name in PARTY_STATES[room_id]:
+                        del PARTY_STATES[room_id][player_name]
+                    # Also clean up ROOM_CLIENT_MAP entry so reconnect is fresh
+                    if room_id in ROOM_CLIENT_MAP:
+                        keys_to_remove = [k for k, v in ROOM_CLIENT_MAP[room_id].items() if v == player_name]
+                        for k in keys_to_remove:
+                            del ROOM_CLIENT_MAP[room_id][k]
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
