@@ -5,8 +5,10 @@ import socket
 import hashlib
 import base64
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 # Global lock and clients dictionary for WebSocket handling
 STATE_LOCK = threading.Lock()
@@ -14,6 +16,93 @@ WEBSOCKET_CLIENTS = {}  # { room_id: set(handler) }
 # The currently authoritative WebSocket for each client id.  This prevents a
 # late close/update from an older connection removing a newly connected player.
 ROOM_CLIENT_CONNECTIONS = {}
+
+LOSTARK_API_BASE_URL = "https://developer-lostark.game.onstove.com"
+CHARACTER_PROFILE_CACHE_TTL = 60 * 60
+CHARACTER_PROFILE_CACHE = {}
+CHARACTER_PROFILE_CACHE_LOCK = threading.Lock()
+
+
+class CharacterLookupError(Exception):
+    def __init__(self, status_code, error_code, message):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.message = message
+
+
+def validate_character_name(character_name):
+    character_name = (character_name or "").strip()
+    if not 1 <= len(character_name) <= 20:
+        raise CharacterLookupError(400, "invalid_character_name", "캐릭터명을 확인해 주세요.")
+    if not all(char.isalnum() for char in character_name):
+        raise CharacterLookupError(400, "invalid_character_name", "캐릭터명에는 문자와 숫자만 사용할 수 있습니다.")
+    return character_name
+
+
+def lookup_character_profile(character_name):
+    """Fetch only the public profile fields needed by the desktop client."""
+    character_name = validate_character_name(character_name)
+    cache_key = character_name.casefold()
+    now = time.time()
+
+    with CHARACTER_PROFILE_CACHE_LOCK:
+        cached = CHARACTER_PROFILE_CACHE.get(cache_key)
+        if cached and now - cached[0] < CHARACTER_PROFILE_CACHE_TTL:
+            return cached[1]
+        if cached:
+            CHARACTER_PROFILE_CACHE.pop(cache_key, None)
+
+    api_key = os.environ.get("LOSTARK_API_KEY", "").strip()
+    if not api_key:
+        raise CharacterLookupError(503, "api_key_not_configured", "캐릭터 자동 감지 기능을 준비 중입니다.")
+
+    authorization = api_key if api_key.lower().startswith("bearer ") else f"bearer {api_key}"
+    encoded_name = quote(character_name, safe="")
+    url = f"{LOSTARK_API_BASE_URL}/armories/characters/{encoded_name}/profiles"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "accept": "application/json",
+            "authorization": authorization,
+            "user-agent": "PengZoomPro-Relay/1.0",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            raise CharacterLookupError(404, "character_not_found", "캐릭터를 찾을 수 없습니다.") from error
+        if error.code == 429:
+            raise CharacterLookupError(429, "rate_limited", "잠시 후 다시 시도해 주세요.") from error
+        if error.code in (401, 403):
+            raise CharacterLookupError(503, "api_auth_failed", "캐릭터 자동 감지 기능을 준비 중입니다.") from error
+        raise CharacterLookupError(502, "upstream_error", "로스트아크 API 응답을 처리하지 못했습니다.") from error
+    except urllib.error.URLError as error:
+        raise CharacterLookupError(502, "upstream_unavailable", "로스트아크 API에 연결할 수 없습니다.") from error
+    except (TimeoutError, json.JSONDecodeError) as error:
+        raise CharacterLookupError(502, "invalid_upstream_response", "로스트아크 API 응답을 처리하지 못했습니다.") from error
+
+    if not isinstance(payload, dict):
+        raise CharacterLookupError(502, "invalid_upstream_response", "로스트아크 API 응답을 처리하지 못했습니다.")
+
+    character_class = payload.get("CharacterClassName")
+    if not character_class:
+        raise CharacterLookupError(404, "character_not_found", "캐릭터를 찾을 수 없습니다.")
+
+    profile = {
+        "character_name": payload.get("CharacterName") or character_name,
+        "character_class": character_class,
+        "server_name": payload.get("ServerName") or "",
+        "character_level": payload.get("CharacterLevel"),
+        "item_level": payload.get("ItemAvgLevel") or "",
+    }
+    with CHARACTER_PROFILE_CACHE_LOCK:
+        CHARACTER_PROFILE_CACHE[cache_key] = (now, profile)
+    return profile
 
 def read_ws_frame(rfile):
     first_byte = rfile.read(1)
@@ -128,9 +217,29 @@ class PartyStatusHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.send_error(405, "This relay accepts WebSocket connections only")
 
+    def send_json(self, status_code, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         parsed_url = urlparse(self.path)
-        if parsed_url.path == "/ws":
+        if parsed_url.path == "/character":
+            character_name = parse_qs(parsed_url.query).get("name", [""])[0]
+            try:
+                profile = lookup_character_profile(character_name)
+                self.send_json(200, profile)
+            except CharacterLookupError as error:
+                self.send_json(error.status_code, {
+                    "error": error.error_code,
+                    "message": error.message,
+                })
+            return
+        elif parsed_url.path == "/ws":
             headers = self.headers
             if headers.get("Upgrade", "").lower() == "websocket":
                 key = headers.get("Sec-WebSocket-Key")
